@@ -2,13 +2,13 @@
 
 **Title will be updated upon acceptance and the DOI will be provided.**
 
-This repository contains the data and R scripts used in an ongoing manuscript investigating biodiversity and conservation shortfalls in Neotropical Rivulidae fishes. The repository will be updated throughout the peer-review process.
+This repository contains the data and R scripts used in an ongoing manuscript. The repository will be updated throughout the peer-review process.
 
 ## Linnean & Wallacean shortfalls
 
 ### R scripts
 
-- **code.R** – Complete workflow for all analyses related to the Linnean and Wallacean shortfalls, including species discovery models, spatial analyses, and figure generation.
+- **code.R** – Complete workflow for all analyses related to the Linnean and Wallacean shortfalls.
 
 ### Data
 
@@ -21,7 +21,7 @@ This repository contains the data and R scripts used in an ongoing manuscript in
 
 ### R scripts
 
-- **Conservation_R.R** – Complete workflow for all conservation shortfall analyses, including conservation assessment lag, protected-area coverage, and figure generation.
+- **Conservation_R.R** – Complete workflow for all conservation shortfall analyses.
 
 ### Data
 
