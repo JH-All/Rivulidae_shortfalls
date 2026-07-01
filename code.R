@@ -36,7 +36,9 @@ packages <- c(
   "nlme",
   "iNEXT",
   "purrr",
-  "ggrepel"
+  "ggrepel",
+  "elevatr",
+  "terra"
 )
 
 load_packages(packages)
@@ -628,7 +630,7 @@ ci_stot_df <- boot_df %>%
     .groups = "drop"
   )
 
-## Table 1 ---------------------------------------------
+## Table 2 ---------------------------------------------
 tabela_final <- tabela_comparacao %>%
   left_join(ci_stot_df, by = "Model") %>%
   select(
@@ -1015,6 +1017,12 @@ ggsave(
 
 # Figure 4A -------------------------------
 ## Preparation ----------------------------
+
+# Here you will need to download HydroATLAS level 9 and insert as a
+# folder in your directory, to follow the rest of the code
+# https://www.hydrosheds.org/hydroatlas
+
+
 hybas9_atlas <- st_read("hydroatlas_9/BasinATLAS_v10_lev09.shp", quiet = TRUE) %>%
   st_transform(4326) %>%
   st_make_valid()
@@ -1214,12 +1222,15 @@ fig4_A <- fig4_A +
 
 fig4_A
 
-# Wallacean shortfall  ------------------------
-## Preparation ----------------------------------
+# Wallacean shortfall within Rivulidae occurrence envelope --------------
+
 sf_use_s2(FALSE)
 
 coverage_threshold <- 0.70
-min_records_well_sampled <- 10
+elevation_threshold <- 2000
+
+## Neotropical region -----------------------------------------------------
+
 neotropics_bbox <- st_bbox(
   c(
     xmin = -120,
@@ -1243,6 +1254,7 @@ land_neotropics <- world_neotropics %>%
   st_union() %>%
   st_make_valid()
 
+## Grid 1 degree ----------------------------------------------------------
 
 grid_1deg <- st_make_grid(
   neotropics_poly,
@@ -1258,6 +1270,8 @@ grid_land <- st_intersection(
   st_make_valid(grid_1deg),
   land_neotropics
 )
+
+## Occurrence data --------------------------------------------------------
 
 valid_species <- species %>%
   filter(status == "valid") %>%
@@ -1286,6 +1300,8 @@ occ_grid <- st_join(
   left = FALSE
 )
 
+## Records and species per cell ------------------------------------------
+
 grid_records_tbl <- occ_grid %>%
   st_drop_geometry() %>%
   count(grid_id, name = "n_records")
@@ -1294,6 +1310,7 @@ grid_species_abund <- occ_grid %>%
   st_drop_geometry() %>%
   count(grid_id, Species, name = "abundance")
 
+## Sample coverage --------------------------------------------------------
 
 get_coverage <- function(x) {
   
@@ -1311,7 +1328,6 @@ get_coverage <- function(x) {
   as.numeric(out$SC[1])
 }
 
-
 grid_coverage_tbl <- grid_species_abund %>%
   group_by(grid_id) %>%
   summarise(
@@ -1320,142 +1336,360 @@ grid_coverage_tbl <- grid_species_abund %>%
     .groups = "drop"
   )
 
-grid_wallace_tbl <- grid_land %>%
-  st_drop_geometry() %>%
-  distinct(grid_id) %>%
-  left_join(grid_records_tbl, by = "grid_id") %>%
-  left_join(grid_coverage_tbl, by = "grid_id") %>%
-  mutate(
-    n_records = replace_na(n_records, 0L),
-    n_species = replace_na(n_species, 0L),
-    sample_coverage_pct = sample_coverage * 100,
-    has_records = n_records > 0,
-    well_sampled = sample_coverage >= coverage_threshold &
-      n_records >= min_records_well_sampled
+## Full grid table --------------------------------------------------------
+
+grid_wallace_raw <- grid_land %>%
+  left_join(
+    grid_land %>%
+      st_drop_geometry() %>%
+      distinct(grid_id) %>%
+      left_join(grid_records_tbl, by = "grid_id") %>%
+      left_join(grid_coverage_tbl, by = "grid_id") %>%
+      mutate(
+        n_records = replace_na(n_records, 0L),
+        n_species = replace_na(n_species, 0L),
+        sample_coverage_pct = sample_coverage * 100,
+        has_records = n_records > 0
+      ),
+    by = "grid_id"
   )
 
-grid_wallace <- grid_land %>%
-  left_join(grid_wallace_tbl, by = "grid_id")
+## Rivulidae occurrence envelope -----------------------------------------
 
-## Summary ---------------------------------
-wallace_summary <- grid_wallace_tbl %>%
+riv_cells <- grid_wallace_raw %>%
+  filter(n_records > 0)
+
+riv_envelope <- tryCatch(
+  {
+    concaveman::concaveman(
+      riv_cells,
+      concavity = 2
+    ) %>%
+      st_union() %>%
+      st_make_valid()
+  },
+  error = function(e) {
+    message("Concaveman failed; using convex hull instead.")
+    
+    riv_cells %>%
+      st_union() %>%
+      st_convex_hull() %>%
+      st_make_valid()
+  }
+)
+
+riv_envelope <- st_intersection(
+  riv_envelope,
+  land_neotropics
+) %>%
+  st_make_valid()
+
+## Andes mask -------------------------------------------------------------
+
+elev_area <- st_as_sf(
+  st_sfc(neotropics_poly),
+  crs = 4326
+)
+
+elev <- elevatr::get_elev_raster(
+  locations = elev_area,
+  z = 5,
+  clip = "locations"
+)
+
+elev_rast <- terra::rast(elev)
+
+andes_mask <- elev_rast > elevation_threshold
+
+andes_poly_raw <- terra::as.polygons(
+  andes_mask,
+  dissolve = TRUE
+) %>%
+  st_as_sf()
+
+value_col <- names(andes_poly_raw)[1]
+
+andes_poly <- andes_poly_raw %>%
+  filter(.data[[value_col]] == 1) %>%
+  st_transform(4326) %>%
+  st_make_valid()
+
+## Remove Andes from concave envelope ------------------------------------
+
+riv_envelope_no_andes <- st_difference(
+  st_make_valid(riv_envelope),
+  st_union(andes_poly)
+) %>%
+  st_make_valid()
+
+## Keep only cells inside/touching Rivulidae envelope without Andes -------
+
+idx_envelope <- lengths(
+  st_intersects(
+    grid_wallace_raw,
+    riv_envelope_no_andes
+  )
+) > 0
+
+grid_wallace <- grid_wallace_raw[idx_envelope, ] %>%
+  mutate(
+    record_status = if_else(
+      n_records > 0,
+      "With Rivulidae records",
+      "Without Rivulidae records"
+    )
+  )
+
+andes_union <- st_union(andes_poly) %>%
+  st_make_valid()
+
+grid_wallace <- grid_wallace %>%
+  mutate(
+    cell_lon = st_coordinates(st_point_on_surface(st_geometry(.)))[, 1],
+    cell_lat = st_coordinates(st_point_on_surface(st_geometry(.)))[, 2],
+    touches_andes = lengths(st_intersects(., andes_union)) > 0
+  ) %>%
+  filter(
+    !(
+      touches_andes &
+        (
+          (cell_lat <= 10  & cell_lat > 0   & cell_lon < -75) |
+            (cell_lat <= 0   & cell_lat > -10 & cell_lon < -74) |
+            (cell_lat <= -10 & cell_lat > -20 & cell_lon < -72) |
+            (cell_lat <= -20 & cell_lat > -35 & cell_lon < -70)
+        )
+    )
+  ) %>%
+  select(-cell_lon, -cell_lat, -touches_andes) %>%
+  mutate(
+    record_status = if_else(
+      n_records > 0,
+      "With Rivulidae records",
+      "Without Rivulidae records"
+    )
+  )
+
+## Summary within Rivulidae envelope -------------------------------------
+
+wallace_envelope_summary <- grid_wallace %>%
+  st_drop_geometry() %>%
   summarise(
     n_cells_total = n(),
-    n_cells_without_records = sum(n_records == 0),
-    percent_cells_without_records = n_cells_without_records / n_cells_total * 100,
     n_cells_with_records = sum(n_records > 0),
+    n_cells_without_records = sum(n_records == 0),
+    percent_with_records = n_cells_with_records / n_cells_total * 100,
+    percent_without_records = n_cells_without_records / n_cells_total * 100,
+    n_records_total = sum(n_records),
     min_records = min(n_records[n_records > 0], na.rm = TRUE),
     mean_records = mean(n_records[n_records > 0], na.rm = TRUE),
     median_records = median(n_records[n_records > 0], na.rm = TRUE),
     max_records = max(n_records[n_records > 0], na.rm = TRUE),
-    n_well_sampled = sum(well_sampled, na.rm = TRUE),
-    percent_well_sampled = n_well_sampled / n_cells_total * 100
+    min_species = min(n_species[n_species > 0], na.rm = TRUE),
+    mean_species = mean(n_species[n_species > 0], na.rm = TRUE),
+    median_species = median(n_species[n_species > 0], na.rm = TRUE),
+    max_species = max(n_species[n_species > 0], na.rm = TRUE)
   )
 
-wallace_summary
+wallace_envelope_summary
+
+## Well-sampled thresholds: 70% coverage + 3 to 20 records ----------------
+
+threshold_summary <- tibble(
+  min_records = 3:20
+) %>%
+  mutate(
+    n_well_sampled = map_int(
+      min_records,
+      ~ sum(
+        grid_wallace$sample_coverage >= coverage_threshold &
+          grid_wallace$n_records >= .x,
+        na.rm = TRUE
+      )
+    ),
+    percent_well_sampled = n_well_sampled / nrow(grid_wallace) * 100
+  )
+
+threshold_summary
 
 grid_wallace <- grid_wallace %>%
   mutate(
-    well_sampled_5 = sample_coverage >= 0.70 &
-      n_records >= 5,
-    
-    well_sampled_10 = sample_coverage >= 0.70 &
-      n_records >= 10,
-    
-    well_sampled_20 = sample_coverage >= 0.70 &
-      n_records >= 20
+    well_sampled_5 = sample_coverage >= coverage_threshold & n_records >= 5,
+    well_sampled_10 = sample_coverage >= coverage_threshold & n_records >= 10,
+    well_sampled_20 = sample_coverage >= coverage_threshold & n_records >= 20
   )
 
-grid_wallace %>%
-  st_drop_geometry() %>%
-  summarise(
-    cells_5 = sum(well_sampled_5, na.rm = TRUE),
-    cells_10 = sum(well_sampled_10, na.rm = TRUE),
-    cells_20 = sum(well_sampled_20, na.rm = TRUE)
-  )
+## Summary of well-sampled cells within Rivulidae envelope ----------------
 
-grid_wallace_tbl %>%
-  filter(n_records > 0) %>%
-  summarise(
-    min = min(n_species),
-    mean = mean(n_species),
-    median = median(n_species),
-    max = max(n_species)
-  )
-
-## Within Rivulidae grid envelope -------------------
-
-riv_cells <- grid_wallace %>%
-  filter(n_records > 0)
-
-riv_grid_envelope <- riv_cells %>%
-  st_union() %>%
-  st_convex_hull() %>%
-  st_make_valid()
-
-idx_envelope <- lengths(
-  st_intersects(
-    grid_wallace,
-    riv_grid_envelope
-  )
-) > 0
-
-grid_within_riv_envelope <- grid_wallace[idx_envelope, ] %>%
-  mutate(
-    record_status = if_else(
-      n_records > 0,
-      "With Rivulidae records",
-      "Without Rivulidae records"
-    )
-  )
-
-wallace_envelope_summary <- grid_within_riv_envelope %>%
+well_sampled_10_summary <- grid_wallace %>%
   st_drop_geometry() %>%
   summarise(
     n_cells_total_envelope = n(),
-    n_cells_with_records = sum(n_records > 0),
-    n_cells_without_records = sum(n_records == 0),
-    percent_with_records = n_cells_with_records / n_cells_total_envelope * 100,
-    percent_without_records = n_cells_without_records / n_cells_total_envelope * 100
+    n_well_sampled_10 = sum(
+      sample_coverage >= coverage_threshold &
+        n_records >= 10,
+      na.rm = TRUE
+    ),
+    percent_well_sampled_10 =
+      n_well_sampled_10 / n_cells_total_envelope * 100
   )
 
-wallace_envelope_summary
+well_sampled_10_summary
 
-riv_cells <- grid_wallace %>%
-  filter(n_records > 0)
-
-riv_grid_envelope <- riv_cells %>%
-  st_union() %>%
-  st_convex_hull() %>%
-  st_make_valid()
-
-idx_envelope <- lengths(
-  st_intersects(
-    grid_wallace,
-    riv_grid_envelope
-  )
-) > 0
-
-grid_within_riv_envelope <- grid_wallace[idx_envelope, ] %>%
-  mutate(
-    record_status = if_else(
-      n_records > 0,
-      "With Rivulidae records",
-      "Without Rivulidae records"
-    )
-  )
-
-wallace_envelope_summary <- grid_within_riv_envelope %>%
+well_sampled_thresholds_summary <- grid_wallace %>%
   st_drop_geometry() %>%
   summarise(
     n_cells_total_envelope = n(),
-    n_cells_with_records = sum(n_records > 0),
-    n_cells_without_records = sum(n_records == 0),
-    percent_with_records = n_cells_with_records / n_cells_total_envelope * 100,
-    percent_without_records = n_cells_without_records / n_cells_total_envelope * 100
+    
+    n_well_sampled_5 = sum(
+      sample_coverage >= 0.70 &
+        n_records >= 5,
+      na.rm = TRUE
+    ),
+    percent_well_sampled_5 =
+      n_well_sampled_5 / n_cells_total_envelope * 100,
+    
+    n_well_sampled_10 = sum(
+      sample_coverage >= 0.70 &
+        n_records >= 10,
+      na.rm = TRUE
+    ),
+    percent_well_sampled_10 =
+      n_well_sampled_10 / n_cells_total_envelope * 100,
+    
+    n_well_sampled_20 = sum(
+      sample_coverage >= 0.70 &
+        n_records >= 20,
+      na.rm = TRUE
+    ),
+    percent_well_sampled_20 =
+      n_well_sampled_20 / n_cells_total_envelope * 100
   )
 
-wallace_envelope_summary
+well_sampled_thresholds_summary
+
+## Coverage stability from 3 to 20 records --------------------------------
+
+coverage_stability <- grid_wallace %>%
+  st_drop_geometry() %>%
+  filter(
+    n_records >= 3,
+    n_records <= 20,
+    !is.na(sample_coverage_pct)
+  ) %>%
+  group_by(n_records) %>%
+  summarise(
+    mean_coverage = mean(sample_coverage_pct, na.rm = TRUE),
+    sd_coverage = sd(sample_coverage_pct, na.rm = TRUE),
+    n_cells = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    sd_coverage = replace_na(sd_coverage, 0),
+    lower = pmax(mean_coverage - sd_coverage, 0),
+    upper = pmin(mean_coverage + sd_coverage, 100)
+  )
+
+coverage_stability
+
+## Figure Mean Coverage ------------------------------------------------------------
+
+fig_cov <- ggplot(
+  coverage_stability,
+  aes(x = n_records, y = mean_coverage)
+) +
+  geom_ribbon(
+    aes(ymin = lower, ymax = upper),
+    alpha = 0.25
+  ) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  geom_hline(
+    yintercept = 70,
+    linetype = "dashed",
+    linewidth = 0.8,
+    color = "gray40"
+  ) +
+  scale_x_continuous(
+    breaks = 3:20
+  ) +
+  scale_y_continuous(
+    limits = c(0, 100),
+    breaks = seq(0, 100, by = 10)
+  ) +
+  theme_classic(base_size = 15) +
+  labs(
+    x = "Number of records per cell",
+    y = "Mean sample coverage (%)"
+  ) +
+  theme(
+    axis.text = element_text(color = "black")
+  )
+
+fig_cov
+
+## Figure S1 ------------------------------------------------------------
+
+fig_s1 <- ggplot() +
+  geom_sf(
+    data = world_neotropics,
+    fill = "gray92",
+    color = "gray65",
+    linewidth = 0.2
+  ) +
+  geom_sf(
+    data = grid_wallace,
+    aes(fill = record_status),
+    color = "black",
+    linewidth = 0.12,
+    alpha = 0.9
+  ) +
+  geom_sf(
+    data = st_as_sf(riv_envelope_no_andes),
+    fill = NA,
+    color = "black",
+    linewidth = 0.9
+  ) +
+  geom_sf(
+    data = world_neotropics,
+    fill = NA,
+    color = "gray35",
+    linewidth = 0.25
+  ) +
+  scale_fill_manual(
+    values = c(
+      "With Rivulidae records" = "#B23A2F",
+      "Without Rivulidae records" = "gray80"
+    ),
+    name = NULL
+  ) +
+  coord_sf(
+    xlim = c(-120, -30),
+    ylim = c(-58, 35),
+    expand = FALSE
+  ) +
+  theme_classic(base_size = 15) +
+  theme(
+    axis.title = element_blank(),
+    legend.position = c(0.25, 0.12),
+    legend.background = element_rect(
+      fill = scales::alpha("white", 0.65),
+      color = NA
+    ),
+    legend.text = element_text(size = 9)
+  )
+
+fig_s1
+
+ggsave(
+  "Figure_S1.tiff",
+  plot = fig_s1,
+  width = 13,
+  height = 6,
+  units = "in",
+  dpi = 600,
+  compression = "lzw",
+  bg = "white"
+)
 
 ## Figure 4B ----------------------------
 fig4_B <- ggplot() +
@@ -1528,7 +1762,7 @@ fig4_C <- ggplot() +
     linewidth = 0.2
   ) +
   geom_sf(
-    data = grid_wallace %>% filter(well_sampled),
+    data = grid_wallace %>% filter(well_sampled_10),
     aes(fill = sample_coverage_pct),
     color = "black",
     alpha = 0.9
@@ -1556,8 +1790,6 @@ fig4_C <- ggplot() +
     legend.position = "right"
   )
 
-fig4_C
-
 fig4_C <- fig4_C +
   guides(
     fill = guide_colorbar(
@@ -1577,14 +1809,16 @@ fig4_C <- fig4_C +
       color = NA
     ),
     legend.title = element_text(size = 9),
-    legend.text = element_text(size = 8,
-                               angle = 45)
+    legend.text = element_text(
+      size = 8,
+      angle = 45
+    )
   )
 
 fig4_C
 
+## Figure 4D: distance to nearest well-sampled cell ------------
 
-# Figure 4D: distance to nearest well-sampled cell ------------
 sf_use_s2(TRUE)
 
 well_cells <- grid_wallace %>%
@@ -1619,7 +1853,6 @@ grid_distance <- record_cells %>%
     dist_nearest_well_km = dist_to_well_km
   )
 
-
 distance_summary <- grid_distance %>%
   st_drop_geometry() %>%
   summarise(
@@ -1632,7 +1865,6 @@ distance_summary <- grid_distance %>%
   )
 
 distance_summary
-
 
 fig4_D <- ggplot() +
   geom_sf(
@@ -1675,8 +1907,6 @@ fig4_D <- ggplot() +
     legend.position = "right"
   )
 
-fig4_D
-
 fig4_D <- fig4_D +
   guides(
     fill = guide_colorbar(
@@ -1696,8 +1926,10 @@ fig4_D <- fig4_D +
       color = NA
     ),
     legend.title = element_text(size = 9),
-    legend.text = element_text(size = 8,
-                               angle = 45)
+    legend.text = element_text(
+      size = 8,
+      angle = 45
+    )
   )
 
 fig4_D
@@ -1725,9 +1957,9 @@ ggsave(
   bg = "white"
 )
 
-# Figure S1 ---------------------------------------------------
-## Figure S1A (5 records) --------------------------------
-fig_S1_A <- ggplot() +
+## Figure S2 ---------------------------------------------------
+### Figure S2A (5 records) ------------------------------------
+fig_S2_A <- ggplot() +
   geom_sf(
     data = world_neotropics,
     fill = "gray92",
@@ -1737,7 +1969,8 @@ fig_S1_A <- ggplot() +
   geom_sf(
     data = grid_wallace %>% filter(well_sampled_5),
     aes(fill = sample_coverage_pct),
-    color = "black"
+    color = "black",
+    alpha = 0.9
   ) +
   geom_sf(
     data = world_neotropics,
@@ -1748,6 +1981,7 @@ fig_S1_A <- ggplot() +
   scale_fill_viridis_c(
     option = "magma",
     limits = c(70, 100),
+    oob = scales::squish,
     name = "Completeness (%)"
   ) +
   coord_sf(
@@ -1755,9 +1989,13 @@ fig_S1_A <- ggplot() +
     ylim = c(-58, 35),
     expand = FALSE
   ) +
-  theme_classic(base_size = 15)
+  theme_classic(base_size = 15) +
+  theme(
+    axis.title = element_blank(),
+    legend.position = "right"
+  )
 
-fig_S1_A <- fig_S1_A +
+fig_S2_A <- fig_S2_A +
   guides(
     fill = guide_colorbar(
       title.position = "top",
@@ -1776,15 +2014,16 @@ fig_S1_A <- fig_S1_A +
       color = NA
     ),
     legend.title = element_text(size = 9),
-    legend.text = element_text(size = 8,
-                               angle = 45)
+    legend.text = element_text(
+      size = 8,
+      angle = 45
+    )
   )
 
-fig_S1_A
+fig_S2_A
 
-
-## Figure S1B (20 records) -------------------------------------------
-fig_S1_B <- ggplot() +
+### Figure S2B (20 records) -----------------------------------
+fig_S2_B <- ggplot() +
   geom_sf(
     data = world_neotropics,
     fill = "gray92",
@@ -1820,9 +2059,7 @@ fig_S1_B <- ggplot() +
     legend.position = "right"
   )
 
-fig_S1_B
-
-fig_S1_B <- fig_S1_B +
+fig_S2_B <- fig_S2_B +
   guides(
     fill = guide_colorbar(
       title.position = "top",
@@ -1841,28 +2078,37 @@ fig_S1_B <- fig_S1_B +
       color = NA
     ),
     legend.title = element_text(size = 9),
-    legend.text = element_text(size = 8,
-                               angle = 45)
+    legend.text = element_text(
+      size = 8,
+      angle = 45
+    )
   )
 
-fig_S1_B
+fig_S2_B
 
-## Figure S1 Complete -------------------------------
-fig_S1 <- (fig_S1_A + fig_S1_B) +
+
+## Figure S2 complete ----------------------------------------
+fig_S2 <- fig_S2_A + fig_S2_B +
+  plot_layout(ncol = 2) +
   plot_annotation(
-    tag_levels = "A"
+    tag_levels = "a",
+    tag_prefix = "(",
+    tag_suffix = ")",
+    theme = theme(
+      plot.tag = element_text(
+        face = "bold",
+        size = 16
+      )
+    )
   )
 
-fig_S1 <- fig_S1 +
-  plot_annotation(tag_levels = "a", tag_prefix = "(", tag_suffix = ")")
-
-fig_S1
+fig_S2
 
 ggsave(
-  "Figure_S1.tiff",
-  plot = fig_S1,
+  "Figure_S2.tiff",
+  plot = fig_S2,
   width = 8,
-  height = 6,
+  height = 4.8,
   units = "in",
   dpi = 600,
   compression = "lzw",
